@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IMDb Dashboard</title>
+  <style>
+    /* Reset & Basic */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; background: #f5f5f5; color: #333; padding: 20px; }
+    h1 { text-align: center; margin-bottom: 20px; }
+    /* Container */
+    .container { max-width: 1200px; margin: auto; }
+    /* Controls */
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; justify-content: center; }
+    .controls input[type="text"], .controls button, .controls select, .controls label { padding: 8px; font-size: 1rem; }
+    .controls input[type="text"], .controls select { flex: 1; min-width: 150px; }
+    #genreFilters { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin: 10px 0; }
+    #genreFilters label { display: flex; align-items: center; gap: 5px; }
+    /* Table */
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e0e0e0; }
+    th { background: #eee; font-weight: bold; cursor: pointer; user-select: none; }
+    th.sorted-asc::after { content: " ▲"; }
+    th.sorted-desc::after { content: " ▼"; }
+    tr:hover { background: #f1f1f1; }
+    .highlight { background: yellow; }
+    /* Score bar */
+    .score-bar { position: relative; background: #ddd; border-radius: 4px; overflow: hidden; height: 16px; width: 100px; }
+    .score-bar-inner { height: 100%; background: #4caf50; }
+    /* Pagination */
+    .pagination { display: flex; justify-content: center; margin: 15px 0; gap: 10px; }
+    .pagination button { padding: 6px 12px; }
+    /* Charts */
+    #charts { display: flex; flex-wrap: wrap; gap: 20px; margin-top: 20px; justify-content: center; }
+    #charts canvas { background: #fff; padding: 10px; border-radius: 8px; }
+    /* Modal */
+    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); justify-content: center; align-items: center; }
+    .modal-content { background: #fff; padding: 20px; border-radius: 8px; max-width: 600px; width: 90%; max-height: 80%; overflow-y: auto; }
+    .modal-content h2 { margin-bottom: 10px; }
+    .modal-content dl { display: grid; grid-template-columns: 1fr 2fr; gap: 10px; }
+    .modal-content dt { font-weight: bold; }
+    .modal-content dd { margin: 0 0 10px; }
+    .close-btn { float: right; cursor: pointer; font-size: 1.2rem; }
+    /* Responsive */
+    @media (max-width: 600px) {
+      th, td { padding: 8px; }
+      .controls, #charts { flex-direction: column; }
+      #genreFilters { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>IMDb Interactive Dashboard</h1>
+    <div class="controls">
+      <input id="sheetUrl" type="text" placeholder="Paste public Google Sheet URL here" />
+      <button id="loadBtn">Load Data</button>
+      <input id="searchInput" type="text" placeholder="Search movies..." disabled />
+      <select id="yearFrom" disabled><option value="">From Year</option></select>
+      <select id="yearTo" disabled><option value="">To Year</option></select>
+      <label>Min. Score:<input id="scoreSlider" type="range" min="0" max="100" value="0" disabled /><span id="scoreValue">0</span></label>
+    </div>
+    <div id="genreFilters"></div>
+    <table id="movieTable">
+      <thead>
+        <tr>
+          <th data-key="names">Title</th>
+          <th data-key="date_x">Date</th>
+          <th data-key="score">Score</th>
+          <th data-key="genre">Genre</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div class="pagination">
+      <button id="prevPage">Previous</button>
+      <span id="pageInfo">Page 1</span>
+      <button id="nextPage">Next</button>
+    </div>
+    <div id="charts">
+      <canvas id="genreChart" width="300" height="300"></canvas>
+      <canvas id="scoreChart" width="300" height="300"></canvas>
+      <canvas id="revenueChart" width="300" height="300"></canvas>
+      <canvas id="roiChart" width="300" height="300"></canvas>
+    </div>
+  </div>
+
+  <div id="modal" class="modal">
+    <div class="modal-content">
+      <span id="closeModal" class="close-btn">&times;</span>
+      <h2 id="modalTitle"></h2>
+      <dl id="modalDetails"></dl>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.3.2/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    const loadBtn = document.getElementById('loadBtn');
+    const sheetUrlInput = document.getElementById('sheetUrl');
+    const searchInput = document.getElementById('searchInput');
+    const yearFrom = document.getElementById('yearFrom');
+    const yearTo = document.getElementById('yearTo');
+    const scoreSlider = document.getElementById('scoreSlider');
+    const scoreValue = document.getElementById('scoreValue');
+    const genreFilters = document.getElementById('genreFilters');
+    const tableBody = document.querySelector('#movieTable tbody');
+    const headers = document.querySelectorAll('th[data-key]');
+    const prevPageBtn = document.getElementById('prevPage');
+    const nextPageBtn = document.getElementById('nextPage');
+    const pageInfo = document.getElementById('pageInfo');
+    const modal = document.getElementById('modal');
+    const closeModal = document.getElementById('closeModal');
+    const modalTitle = document.getElementById('modalTitle');
+    const modalDetails = document.getElementById('modalDetails');
+
+    let movies = [], filtered = [], selectedGenres = new Set();
+    let sortKey = null, sortDir = 1, currentPage = 1, pageSize = 20, searchTerm = '';
+    let genreChart, scoreChart, revenueChart, roiChart;
+
+    function parseSheetId(url) { const m = url.match(/\/d\/(.*?)(\/|$)/); return m?m[1]:null; }
+    function buildCsvUrl(id) { return `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&gid=0`; }
+
+    function loadData() {
+      const id = parseSheetId(sheetUrlInput.value.trim());
+      if(!id) return alert('Invalid Google Sheet URL');
+      Papa.parse(buildCsvUrl(id), {
+        download: true, header: true, skipEmptyLines: true,
+        complete: r => {
+          movies = r.data.map(m => {
+            const [d,M,y] = m.date_x.split('/').map(s=>parseInt(s,10));
+            return {...m, dateObj: new Date(y,M-1,d)};
+          });
+          enableControls(); populateYearSelectors(); renderGenreFilters(); applyFilters();
+        },
+        error: e => alert('Error: ' + e)
+      });
+    }
+
+    function enableControls() { [searchInput, yearFrom, yearTo, scoreSlider].forEach(el=>el.disabled=false); }
+
+    function populateYearSelectors() {
+      const yrs = movies.map(m=>m.dateObj.getFullYear()).filter(y=>isFinite(y)&&y>=1952);
+      const uniq = [...new Set(yrs)].sort((a,b)=>a-b);
+      yearFrom.innerHTML = '<option value="">From Year</option>';
+      yearTo.innerHTML   = '<option value="">To Year</option>';
+      uniq.forEach(y => {
+        const o = document.createElement('option'); o.value=y; o.textContent=y;
+        yearFrom.appendChild(o); yearTo.appendChild(o.cloneNode(true));
+      });
+    }
+
+    function renderGenreFilters() {
+      const s = new Set();
+      movies.forEach(m => m.genre.split(',').map(g=>g.trim()).filter(g=>g).forEach(g=>s.add(g)));
+      genreFilters.innerHTML = '';
+      s.forEach(g => {
+        const lbl = document.createElement('label');
+        const cb = document.createElement('input'); cb.type='checkbox'; cb.value=g;
+        cb.addEventListener('change', ()=>{ cb.checked?selectedGenres.add(g):selectedGenres.delete(g); resetPage(); applyFilters(); });
+        lbl.append(cb, document.createTextNode(g)); genreFilters.append(lbl);
+      });
+    }
+
+    function updateCharts(data) {
+      const genresCount={}, scores=[], revenues=[], rois=[];
+      data.forEach(m => {
+        m.genre.split(',').map(g=>g.trim()).filter(g=>g).forEach(g=> genresCount[g]=(genresCount[g]||0)+1 );
+        const rev=+m.revenue||0, bud=+m.budget_x||0;
+        scores.push(+m.score);
+        revenues.push(rev);
+        rois.push(bud>0 ? rev/bud : 0);
+      });
+      if(genreChart) genreChart.destroy();
+      genreChart = new Chart(document.getElementById('genreChart'), { type:'pie', data:{ labels:Object.keys(genresCount), datasets:[{ data:Object.values(genresCount) }] }, options:{ plugins:{ title:{ display:true, text:'Genre Distribution' } }} });
+      const bins=10, max=100, step=max/bins, counts=new Array(bins).fill(0);
+      scores.forEach(s=>counts[Math.min(Math.floor(s/step),bins-1)]++);
+      const sLabels=counts.map((_,i)=>`${i*step}-${(i+1)*step}`);
+      if(scoreChart) scoreChart.destroy();
+      scoreChart = new Chart(document.getElementById('scoreChart'), { type:'bar', data:{ labels:sLabels, datasets:[{ data:counts }] }, options:{ plugins:{ title:{ display:true, text:'Score Distribution' } }} });
+      const sortedByRev = data.slice().sort((a,b)=> (+b.revenue||0) - (+a.revenue||0)).slice(0,10);
+      const rLabels = sortedByRev.map(m=>m.names), rData = sortedByRev.map(m=>+m.revenue||0);
+      if(revenueChart) revenueChart.destroy();
+      revenueChart = new Chart(document.getElementById('revenueChart'), { type:'bar', data:{ labels:rLabels, datasets:[{ data:rData }] }, options:{ plugins:{ title:{ display:true, text:'Top 10 Movies by Revenue' } }} });
+      const sortedByROI = data.slice().sort((a,b)=>{ const r1=(+b.revenue||0)/(+b.budget_x||1); const r2=(+a.revenue||0)/(+a.budget_x||1); return r1-r2; }).slice(0,10);
+      const roiLabels = sortedByROI.map(m=>m.names), roiData = sortedByROI.map(m=> m.budget_x>0 ? (+m.revenue||0)/(+m.budget_x||1) : 0);
+      if(roiChart) roiChart.destroy();
+      roiChart = new Chart(document.getElementById('roiChart'), { type:'bar', data:{ labels:roiLabels, datasets:[{ data:roiData }] }, options:{ plugins:{ title:{ display:true, text:'Top 10 ROI (Revenue / Budget)' } }} });
+    }
+
+    function sortAndPaginate() {
+      if (sortKey) filtered.sort((a,b)=> sortDir * ((a[sortKey] > b[sortKey]) ? 1 : (a[sortKey] < b[sortKey]) ? -1 : 0));
+      const totalPages = Math.ceil(filtered.length / pageSize) || 1;
+      if (currentPage > totalPages) currentPage = totalPages;
+      pageInfo.textContent = `Page ${currentPage} of ${totalPages}`;
+    }
+
+    function applyFilters() {
+      searchTerm = searchInput.value.trim().toLowerCase();
+      const fY=+yearFrom.value||null, tY=+yearTo.value||null, minS=+scoreSlider.value;
+      filtered = movies.filter(m=>{
+        const txt=Object.values(m).some(v=>typeof v==='string'&&v.toLowerCase().includes(searchTerm));
+        const gm=!selectedGenres.size||m.genre.split(',').some(g=>selectedGenres.has(g.trim()));
+        const y=m.dateObj.getFullYear(); const ym=(!fY||y>=fY)&&(!tY||y<=tY);
+        const sm=+m.score>=minS; return txt&&gm&&ym&&sm;
+      });
+      updateCharts(filtered); sortAndPaginate(); renderTable();
+    }
+
+    function renderTable() {
+      tableBody.innerHTML='';
+      const start=(currentPage-1)*pageSize;
+      filtered.slice(start,start+pageSize).forEach((m,i)=>{
+        const tr=document.createElement('tr');
+        ['names','date_x','score','genre'].forEach(key=>{
+          const td=document.createElement('td');
+          if(key==='score'){
+            const val=+m.score;
+            const bar=document.createElement('div'); bar.className='score-bar';
+            const inner=document.createElement('div'); inner.className='score-bar-inner'; inner.style.width=`${val}%`;
+            bar.append(inner); td.append(bar);
+          } else {
+            const txt=m[key];
+            if(searchTerm&&typeof txt==='string'){
+              const re=new RegExp(`(${searchTerm.replace(/[[\]\\.*+?^${}()|]/g,'\\$&')})`,'gi');
+              td.innerHTML=txt.replace(re,'<span class="highlight">$1</span>');
+            } else td.textContent=txt;
+          }
+          if(key==='names'){ td.style.cursor='pointer'; td.addEventListener('click',()=>showModal(start+i)); }
+          tr.appendChild(td);
+        }); tableBody.appendChild(tr);
+      });
+    }
+
+    headers.forEach(h=>h.addEventListener('click',()=>{ const k=h.dataset.key; sortDir=(sortKey===k?-sortDir:1); sortKey=k; headers.forEach(x=>x.classList.remove('sorted-asc','sorted-desc')); h.classList.add(sortDir>0?'sorted-asc':'sorted-desc'); resetPage(); applyFilters(); }));
+    function resetPage(){ currentPage=1; }
+    [['input',searchInput],['change',yearFrom],['change',yearTo],['input',scoreSlider]].forEach(([ev,el])=>el.addEventListener(ev,()=>{ resetPage(); if(el===scoreSlider) scoreValue.textContent=scoreSlider.value; applyFilters(); }));
+    prevPageBtn.addEventListener('click',()=>{ if(currentPage>1){ currentPage--; sortAndPaginate(); renderTable(); }});
+    nextPageBtn.addEventListener('click',()=>{ currentPage++; sortAndPaginate(); renderTable(); });
+    function showModal(i){ const m=filtered[i]; modalTitle.textContent=m.names; modalDetails.innerHTML=''; Object.entries(m).forEach(([k,v])=>{ const dt=document.createElement('dt'); dt.textContent=k.replace(/_/g,' '); const dd=document.createElement('dd'); dd.textContent=v; modalDetails.append(dt,dd);} ); modal.style.display='flex'; }
+    closeModal.addEventListener('click',()=>modal.style.display='none');
+    window.addEventListener('click',e=>{ if(e.target===modal) modal.style.display='none'; });
+    loadBtn.addEventListener('click',loadData);
+  </script>
+</body>
+</html>
